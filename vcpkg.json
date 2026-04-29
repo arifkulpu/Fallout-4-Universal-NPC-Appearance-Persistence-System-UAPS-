@@ -1,0 +1,21 @@
+{
+  "name": "universalappearance",
+  "version": "1.0.0",
+  "dependencies": [
+    "fmt",
+    "spdlog",
+    "nlohmann-json",
+    "boost-stl-interfaces",
+    "boost-algorithm",
+    "boost-preprocessor",
+    "boost-stacktrace",
+    "rsm-mmio",
+    "frozen",
+    "xbyak",
+    "boost-regex",
+    "boost-endian",
+    "boost-filesystem",
+    "boost-system"
+  ],
+  "builtin-baseline": "d7b75fa8a30478ae5b5eb86ac730f851ef036875"
+}

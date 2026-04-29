@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+bin/
+lib/
+out/
+.vs/
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.filters
+*.dir
+
+# F4SE artifacts
+*.dll
+*.pdb
+
+# Dependencies
+_deps/
+vcpkg_installed/
+
+# OS files
+.DS_Store
+Thumbs.db
