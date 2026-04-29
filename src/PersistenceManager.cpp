@@ -171,10 +171,24 @@ class MenuWatcher : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
 public:
 	virtual RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent& a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>* a_source) override
 	{
-		if (a_event.menuName == "RaceSexMenu" && !a_event.opening) {
-			spdlog::info("RaceSexMenu (SLM) closed.");
+		if (a_event.menuName == "RaceSexMenu"sv && !a_event.opening) {
+			spdlog::info("RaceSexMenu closed. Checking for changes...");
+			
+			// Önce oyuncuyu kontrol et
 			auto player = RE::PlayerCharacter::GetSingleton();
-			PersistenceManager::GetSingleton()->SaveToWatchlist(player);
+			if (player) {
+				PersistenceManager::GetSingleton()->SaveToWatchlist(player);
+			}
+
+			// Eğer konsolda bir NPC seçiliyse (genelde slm komutu için seçilir), onu da kaydet
+			auto console = RE::Console::GetPickRef();
+			if (console) {
+				auto actor = console.get()->As<RE::Actor>();
+				if (actor && actor != player) {
+					spdlog::info("Detected NPC edit via console: {:08X}. Saving...", actor->formID);
+					PersistenceManager::GetSingleton()->SaveToWatchlist(actor);
+				}
+			}
 		}
 		return RE::BSEventNotifyControl::kContinue;
 	}
