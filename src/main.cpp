@@ -17,8 +17,8 @@ void OnSLMMenuExit(std::monostate)
 
 void ReloadWatchlist(std::monostate)
 {
-	spdlog::info("Reloading watchlist from Papyrus.");
-	PersistenceManager::GetSingleton()->LoadWatchlist();
+	spdlog::info("ReloadWatchlist from Papyrus: Reloading JSON data.");
+	PersistenceManager::GetSingleton()->LoadFromJson();
 }
 
 void RemoveFromWatchlist(std::monostate, uint32_t a_formID)
@@ -40,12 +40,22 @@ void MessageHandler(F4SE::MessagingInterface::Message* a_msg)
 {
 	switch (a_msg->type) {
 	case F4SE::MessagingInterface::kGameDataReady:
-		PersistenceManager::GetSingleton()->LoadWatchlist();
 		PersistenceManager::GetSingleton()->InitializeHooks();
-		PersistenceManager::GetSingleton()->RegisterMenuWatcher();
 		break;
 	}
 }
+
+extern "C" DLLEXPORT constinit auto F4SEPlugin_Version = []() constexpr {
+	F4SE::PluginVersionData v{};
+	v.PluginVersion({ 1, 0, 0, 0 });
+	v.PluginName("UniversalAppearance");
+	v.AuthorName("arifkulpu");
+	v.UsesAddressLibrary(true);
+	v.UsesSigScanning(false);
+	v.IsLayoutDependent(true);
+	v.HasNoStructUse(false);
+	return v;
+}();
 
 extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a_f4se, F4SE::PluginInfo* a_info)
 {
@@ -73,7 +83,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a
 		return false;
 	}
 
-	if (a_f4se->RuntimeVersion() < F4SE::RUNTIME_1_10_163) {
+	if (a_f4se->RuntimeVersion() < REL::Version{ 1, 10, 163, 0 }) {
 		spdlog::critical("Unsupported runtime version!");
 		return false;
 	}
@@ -95,6 +105,21 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 	auto messaging = F4SE::GetMessagingInterface();
 	if (messaging) {
 		messaging->RegisterListener(MessageHandler);
+	}
+
+	auto serialization = F4SE::GetSerializationInterface();
+	if (serialization) {
+		serialization->SetUniqueID('UAPS');
+		serialization->SetSaveCallback([](const F4SE::SerializationInterface* a_intfc) {
+			PersistenceManager::GetSingleton()->SaveCallback(a_intfc);
+		});
+		serialization->SetLoadCallback([](const F4SE::SerializationInterface* a_intfc) {
+			PersistenceManager::GetSingleton()->LoadCallback(a_intfc);
+		});
+		serialization->SetRevertCallback([](const F4SE::SerializationInterface* a_intfc) {
+			PersistenceManager::GetSingleton()->RevertCallback(a_intfc);
+		});
+		spdlog::info("Registered F4SE Serialization Callbacks.");
 	}
 
 	return true;

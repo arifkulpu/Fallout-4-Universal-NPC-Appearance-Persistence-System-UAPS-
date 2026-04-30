@@ -2,208 +2,353 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/msvc_sink.h>
 #include "PersistenceManager.h"
+#include "RE/Bethesda/TESBoundAnimObjects.h"
+#include "RE/Bethesda/Actor.h"
+#include "RE/Bethesda/TESDataHandler.h"
+#include "RE/Bethesda/BGSHeadPart.h"
+#include "RE/Bethesda/BSScript/Internal/VirtualMachine.h"
+#include "RE/Bethesda/BSScriptUtil.h"
+#include "F4SE/API.h"
 #include <fstream>
+#include <thread>
 
-void PersistenceManager::LoadWatchlist()
-{
-	if (!fs::exists(_storagePath)) {
-		fs::create_directories(_storagePath);
-		return;
+constexpr auto UAPS_JSON_FILE = "Data/F4SE/Plugins/UAPS_Data.json";
+
+// Manual declaration for BGSCharacterTint::Entries to avoid missing definitions
+namespace RE {
+	namespace BGSCharacterTint {
+		struct Entries {
+			BSSimpleList<void*> entries; // Using void* as we don't have the full Entry struct definition
+		};
 	}
+}
 
+// ... [Keep previous FormIDToString, StringToFormID, ColorToHex, HexToColor, ComputeHash, SaveToWatchlist, RemoveFromWatchlist, IsInWatchlist]
+
+std::string PersistenceManager::FormIDToString(uint32_t a_formID) {
+	auto form = RE::TESForm::GetFormByID(a_formID);
+	if (form) {
+		auto file = form->GetFile(0);
+		if (file) {
+			uint32_t localID = form->GetLocalFormID();
+			char buffer[256];
+			snprintf(buffer, sizeof(buffer), "%s|%08X", file->filename, localID);
+			return std::string(buffer);
+		}
+	}
+	char buffer[64];
+	snprintf(buffer, sizeof(buffer), "%08X", a_formID);
+	return std::string(buffer);
+}
+
+uint32_t PersistenceManager::StringToFormID(const std::string& a_str) {
+	auto pos = a_str.find('|');
+	if (pos == std::string::npos) {
+		try { return std::stoul(a_str, nullptr, 16); } catch (...) { return 0; }
+	}
+	std::string modName = a_str.substr(0, pos);
+	std::string idStr = a_str.substr(pos + 1);
 	auto dataHandler = RE::TESDataHandler::GetSingleton();
-
-	for (const auto& entry : fs::directory_iterator(_storagePath)) {
-		if (entry.path().extension() == ".json") {
-			try {
-				std::ifstream i(entry.path());
-				nlohmann::json j;
-				i >> j;
-
-				std::string plugin = j["plugin"];
-				uint32_t localID = j["localID"];
-				std::string npcName = j.contains("name") ? j["name"].get<std::string>() : "Unknown";
-
-				// Custom lookup
-				RE::TESForm* form = nullptr;
-				for (auto file : dataHandler->files) {
-					if (file && _stricmp(file->filename, plugin.c_str()) == 0) {
-						uint32_t globalID = 0;
-						if (file->compileIndex != 0xFF) {
-							globalID = (file->compileIndex << 24) | (localID & 0x00FFFFFF);
-						} else if (file->smallFileCompileIndex != 0xFFFF) {
-							globalID = 0xFE000000 | (file->smallFileCompileIndex << 12) | (localID & 0x00000FFF);
-						} else {
-							continue;
-						}
-						form = RE::TESForm::GetFormByID(globalID);
-						break;
-					}
-				}
-
-				if (form) {
-					_watchlist.insert(form->formID);
-					spdlog::info("Tracking NPC: {} ({:08X})", npcName, form->formID);
-				}
-			} catch (const std::exception& e) {
-				spdlog::error("Failed to load NPC data {}: {}", entry.path().string(), e.what());
-			}
-		}
-	}
+	if (!dataHandler) return 0;
+	try {
+		uint32_t localID = std::stoul(idStr, nullptr, 16);
+		return dataHandler->LookupFormID(localID, modName);
+	} catch (...) { return 0; }
 }
 
-void PersistenceManager::RemoveFromWatchlist(std::uint32_t a_formID)
-{
-	auto it = _watchlist.find(a_formID);
-	if (it != _watchlist.end()) {
-		_watchlist.erase(it);
-
-		auto form = RE::TESForm::GetFormByID(a_formID);
-		if (form) {
-			auto npc = form->As<RE::TESNPC>();
-			if (npc) {
-				auto file = npc->GetFile(0);
-				std::string pluginName = file ? std::string(file->filename) : "Fallout4.esm";
-				uint32_t localID = file ? (a_formID & 0x00FFFFFF) : a_formID;
-				std::string fileName = fmt::format("{}_{:08X}.json", pluginName, localID);
-				fs::remove(_storagePath / fileName);
-				
-				auto actor = RE::TESForm::GetFormByID<RE::Actor>(a_formID);
-				if (actor) {
-					actor->formFlags &= ~0x400; // Unset Persistent flag
-				}
-				
-				spdlog::info("Removed NPC {} from watchlist and deleted data.", npc->GetFullName());
-			}
-		}
-	}
+std::string PersistenceManager::ColorToHex(uint32_t a_color) {
+	char buffer[16];
+	snprintf(buffer, sizeof(buffer), "#%06X", a_color & 0xFFFFFF);
+	return std::string(buffer);
 }
 
-void PersistenceManager::SaveToWatchlist(RE::Actor* a_actor)
-{
+uint32_t PersistenceManager::HexToColor(const std::string& a_hex) {
+	if (a_hex.empty() || a_hex[0] != '#') return 0;
+	try { return std::stoul(a_hex.substr(1), nullptr, 16); } catch (...) { return 0; }
+}
+
+uint64_t PersistenceManager::ComputeHash(const NPC_Appearance& data) {
+	uint64_t hash = 14695981039346656037ULL;
+	auto fnv = [&hash](const void* d, size_t size) {
+		const uint8_t* ptr = static_cast<const uint8_t*>(d);
+		for (size_t i = 0; i < size; ++i) {
+			hash ^= ptr[i];
+			hash *= 1099511628211ULL;
+		}
+	};
+	fnv(data.skinColor.data(), data.skinColor.size());
+	fnv(data.assets.hairID.data(), data.assets.hairID.size());
+	fnv(data.assets.eyesID.data(), data.assets.eyesID.size());
+	fnv(data.geometry.morphs.data(), data.geometry.morphs.size() * sizeof(float));
+	fnv(data.geometry.weights.data(), data.geometry.weights.size() * sizeof(float));
+	for (const auto& t : data.tints) {
+		fnv(&t.index, sizeof(t.index));
+		fnv(t.color.data(), t.color.size());
+		fnv(&t.alpha, sizeof(t.alpha));
+	}
+	return hash;
+}
+
+void PersistenceManager::SaveToWatchlist(RE::Actor* a_actor) {
 	if (!a_actor) return;
-
 	RE::TESNPC* npc = a_actor->GetNPC();
 	if (!npc) return;
 
-	nlohmann::json j;
+	std::lock_guard<std::mutex> lock(_lock);
+	NPC_Appearance data;
+	
+	if (npc->IsUnique()) data.type = "Unique";
+	else data.type = (a_actor->GetFormID() >= 0xFF000000) ? "Settler" : "Raider";
+	data.name = npc->GetFullName();
 
-	auto formID = npc->formID;
-	auto file = npc->GetFile(0);
-	std::string pluginName = file ? std::string(file->filename) : "Fallout4.esm";
-	uint32_t localID = file ? (formID & 0x00FFFFFF) : formID;
-
-	j["plugin"] = pluginName;
-	j["localID"] = localID;
-	j["name"] = npc->GetFullName();
-
-	// Morphs
+	uint32_t sColor = (npc->bodyTintColorR << 16) | (npc->bodyTintColorG << 8) | npc->bodyTintColorB;
+	data.skinColor = ColorToHex(sColor);
+	
 	if (npc->morphSliderValues) {
-		auto& morphs = j["morphs"];
 		for (auto& entry : *npc->morphSliderValues) {
-			morphs[std::to_string(entry.first)] = entry.second;
+			data.geometry.morphs.push_back(entry.second);
 		}
 	}
 
-	std::string fileName = fmt::format("{}_{:08X}.json", pluginName, localID);
-	std::ofstream o(_storagePath / fileName);
-	o << j.dump(4);
+	for (auto hp : npc->GetHeadParts()) {
+		if (hp) {
+			std::string hpStr = FormIDToString(hp->formID);
+			if (hpStr.find("Hair") != std::string::npos) data.assets.hairID = hpStr;
+			else if (hpStr.find("Eyes") != std::string::npos) data.assets.eyesID = hpStr;
+			else data.assets.otherHeadParts.push_back(hpStr);
+		}
+	}
 
-	_watchlist.insert(formID);
+	data.appearanceHash = ComputeHash(data);
+	uint32_t storeID = (data.type == "Unique") ? npc->formID : a_actor->GetFormID();
+	_npcData[storeID] = data;
 	
-	a_actor->formFlags |= 0x400; // Set Persistent
-	
-	spdlog::info("Saved NPC {} to watchlist.", npc->GetFullName());
+	spdlog::info("Saved appearance for NPC: {} ({})", data.name, FormIDToString(storeID));
+	SaveToJson();
 }
 
-bool PersistenceManager::IsInWatchlist(std::uint32_t a_formID)
-{
-	return _watchlist.find(a_formID) != _watchlist.end();
+void PersistenceManager::RemoveFromWatchlist(std::uint32_t a_formID) {
+	std::lock_guard<std::mutex> lock(_lock);
+	_npcData.erase(a_formID);
+	_runtimeCache.erase(a_formID);
+	spdlog::info("Removed NPC: {:08X}", a_formID);
+	SaveToJson();
 }
 
-void PersistenceManager::ApplyAppearance(RE::Actor* a_actor)
+bool PersistenceManager::IsInWatchlist(std::uint32_t a_formID) {
+	std::lock_guard<std::mutex> lock(_lock);
+	return _npcData.contains(a_formID);
+}
+
+// ------------------------------------------------------------
+// SAFE PAPYRUS INVOCATION HELPERS
+// ------------------------------------------------------------
+void CallPapyrusChangeHeadPart(RE::Actor* a_actor, RE::BGSHeadPart* a_part)
 {
+	auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+	if (!vm || !a_actor || !a_part) return;
+
+	auto& policy = vm->GetObjectHandlePolicy();
+
+	uint64_t handle = policy.GetHandleForObject(static_cast<uint32_t>(a_actor->GetFormType()), a_actor);
+	if (handle != policy.EmptyHandle()) {
+		RE::BSTSmartPointer<RE::BSScript::IStackCallbackFunctor> callback;
+		static_cast<RE::BSScript::IVirtualMachine*>(vm)->DispatchMethodCall(handle, "Actor", "ChangeHeadPart", callback, a_part);
+	}
+}
+
+void CallPapyrusUpdateAppearance(RE::Actor* a_actor)
+{
+	auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+	if (!vm || !a_actor) return;
+
+	auto& policy = vm->GetObjectHandlePolicy();
+
+	uint64_t handle = policy.GetHandleForObject(static_cast<uint32_t>(a_actor->GetFormType()), a_actor);
+	if (handle != policy.EmptyHandle()) {
+		RE::BSTSmartPointer<RE::BSScript::IStackCallbackFunctor> callback;
+		static_cast<RE::BSScript::IVirtualMachine*>(vm)->DispatchMethodCall(handle, "Actor", "UpdateAppearance", callback);
+	}
+}
+
+void CallPapyrusQueueRestoring(RE::Actor* a_actor)
+{
+	// QueueRestoring is often empty or not strictly necessary if UpdateAppearance works, but we call it if defined.
+	// We'll use the same pattern.
+	auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+	if (!vm || !a_actor) return;
+
+	auto& policy = vm->GetObjectHandlePolicy();
+
+	uint64_t handle = policy.GetHandleForObject(static_cast<uint32_t>(a_actor->GetFormType()), a_actor);
+	if (handle != policy.EmptyHandle()) {
+		RE::BSTSmartPointer<RE::BSScript::IStackCallbackFunctor> callback;
+		static_cast<RE::BSScript::IVirtualMachine*>(vm)->DispatchMethodCall(handle, "Actor", "QueueRestoring", callback);
+	}
+}
+// ------------------------------------------------------------
+
+void PersistenceManager::ApplyAppearance(RE::Actor* a_actor) {
 	if (!a_actor) return;
-	
 	RE::TESNPC* npc = a_actor->GetNPC();
-	if (!npc || _watchlist.find(npc->formID) == _watchlist.end()) return;
+	if (!npc) return;
 
-	auto formID = npc->formID;
-	auto file = npc->GetFile(0);
-	std::string pluginName = file ? std::string(file->filename) : "Fallout4.esm";
-	uint32_t localID = file ? (formID & 0x00FFFFFF) : formID;
-	std::string fileName = fmt::format("{}_{:08X}.json", pluginName, localID);
-	
-	fs::path path = _storagePath / fileName;
-	if (!fs::exists(path)) return;
+	std::lock_guard<std::mutex> lock(_lock);
+	uint32_t lookupID = npc->IsUnique() ? npc->formID : a_actor->GetFormID();
 
-	try {
-		std::ifstream i(path);
-		nlohmann::json j;
-		i >> j;
+	if (!_npcData.contains(lookupID)) return;
 
-		spdlog::info("Applying appearance to NPC: {}", npc->GetFullName());
+	auto& cache = _runtimeCache[lookupID];
+	if (cache.isApplying) return; 
 
-		if (j.contains("morphs") && npc->morphSliderValues) {
-			auto& morphData = j["morphs"];
-			for (auto& [key, val] : morphData.items()) {
-				uint32_t morphID = std::stoul(key);
-				npc->morphSliderValues->insert({ morphID, val.get<float>() });
-			}
-		}
-
-		// Refresh 3D
-		a_actor->Reset3D(true, 0, false, 0);
-		a_actor->formFlags |= 0x400; // Ensure Persistent
-
-	} catch (const std::exception& e) {
-		spdlog::error("Error applying appearance for {}: {}", npc->GetFullName(), e.what());
+	auto& savedData = _npcData[lookupID];
+	if (cache.lastHash == savedData.appearanceHash && savedData.appearanceHash != 0) {
+		return; 
 	}
-}
 
-void PersistenceManager::InitializeHooks()
-{
-	spdlog::info("PersistenceManager hooks initialized.");
-}
+	cache.isApplying = true;
+	spdlog::info("Queueing appearance application for NPC: {}", savedData.name);
 
-class MenuWatcher : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
-{
-public:
-	virtual RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent& a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>* a_source) override
-	{
-		if (a_event.menuName == "RaceSexMenu"sv && !a_event.opening) {
-			spdlog::info("RaceSexMenu closed. Checking for changes...");
-			
-			// Önce oyuncuyu kontrol et
-			auto player = RE::PlayerCharacter::GetSingleton();
-			if (player) {
-				PersistenceManager::GetSingleton()->SaveToWatchlist(player);
-			}
-
-			// Eğer konsolda bir NPC seçiliyse (genelde slm komutu için seçilir), onu da kaydet
-			auto console = RE::Console::GetPickRef();
-			if (console) {
-				auto actor = console.get()->As<RE::Actor>();
-				if (actor && actor != player) {
-					spdlog::info("Detected NPC edit via console: {:08X}. Saving...", actor->formID);
-					PersistenceManager::GetSingleton()->SaveToWatchlist(actor);
+	// TASK QUEUE (Execute on Main Thread to prevent CTD)
+	F4SE::GetTaskInterface()->AddTask([a_actor, npc, savedData]() {
+		try {
+			// 1. FaceGen (Morphs)
+			if (npc->morphSliderValues && savedData.geometry.morphs.size() == npc->morphSliderValues->size()) {
+				uint32_t index = 0;
+				for (auto& [key, val] : *npc->morphSliderValues) {
+					val = savedData.geometry.morphs[index++];
 				}
 			}
-		}
-		return RE::BSEventNotifyControl::kContinue;
-	}
 
-	static void Register()
-	{
-		auto ui = RE::UI::GetSingleton();
-		if (ui) {
-			ui->GetEventSource<RE::MenuOpenCloseEvent>()->RegisterSink(new MenuWatcher());
-			spdlog::info("Registered RaceSexMenu watcher.");
-		}
-	}
-};
+			// 2. HeadParts (Papyrus VM üzerinden ChangeHeadPart)
+			if (!savedData.assets.hairID.empty()) {
+				uint32_t hairFormID = PersistenceManager::GetSingleton()->StringToFormID(savedData.assets.hairID);
+				if (hairFormID) {
+					auto newHair = RE::TESForm::GetFormByID<RE::BGSHeadPart>(hairFormID);
+					if (newHair) CallPapyrusChangeHeadPart(a_actor, newHair);
+				}
+			}
+			
+			if (!savedData.assets.eyesID.empty()) {
+				uint32_t eyesFormID = PersistenceManager::GetSingleton()->StringToFormID(savedData.assets.eyesID);
+				if (eyesFormID) {
+					auto newEyes = RE::TESForm::GetFormByID<RE::BGSHeadPart>(eyesFormID);
+					if (newEyes) CallPapyrusChangeHeadPart(a_actor, newEyes);
+				}
+			}
 
-void PersistenceManager::RegisterMenuWatcher()
-{
-	MenuWatcher::Register();
+			// 3. Tints (Clear list and apply skin color to avoid Brown Face)
+			uint32_t parsedColor = PersistenceManager::GetSingleton()->HexToColor(savedData.skinColor);
+			npc->bodyTintColorR = (parsedColor >> 16) & 0xFF;
+			npc->bodyTintColorG = (parsedColor >> 8) & 0xFF;
+			npc->bodyTintColorB = parsedColor & 0xFF;
+
+			// Clear tints using memory offset logic if tintingData is valid
+			if (npc->tintingData) {
+				// We don't have the exact Entry struct, so we can clear the BSSimpleList
+				// This usually resets the face overlays, solving the Brown Face bug.
+				auto entriesList = reinterpret_cast<RE::BGSCharacterTint::Entries*>(npc->tintingData);
+				entriesList->entries.clear(); 
+			}
+
+			// 4. QueueRestoring & UpdateAppearance
+			CallPapyrusQueueRestoring(a_actor);
+			CallPapyrusUpdateAppearance(a_actor);
+			
+			spdlog::info("Appearance applied on main thread for {}", savedData.name);
+		} catch (const std::exception& e) {
+			spdlog::error("Error in TaskQueue applying appearance: {}", e.what());
+		}
+	});
+
+	cache.lastHash = savedData.appearanceHash;
+	cache.isApplying = false;
 }
+
+void PersistenceManager::LoadFromJson() {
+	try {
+		std::ifstream file(UAPS_JSON_FILE);
+		if (!file.is_open()) return;
+		nlohmann::json j;
+		file >> j;
+
+		if (j.contains("data")) {
+			_npcData.clear();
+			_runtimeCache.clear();
+			
+			for (auto& [keyStr, val] : j["data"].items()) {
+				uint32_t formID = StringToFormID(keyStr);
+				if (formID != 0) {
+					NPC_Appearance app = val.get<NPC_Appearance>();
+					_npcData[formID] = app;
+				}
+			}
+			spdlog::info("Loaded UAPS data from JSON. Entries: {}", _npcData.size());
+		}
+	} catch (const std::exception& e) {
+		spdlog::error("Error loading JSON: {}", e.what());
+	}
+}
+
+void PersistenceManager::SaveToJson() {
+	std::thread([this]() {
+		try {
+			std::lock_guard<std::mutex> lock(_lock);
+			nlohmann::json j;
+			j["uaps_version"] = "1.0";
+			
+			nlohmann::json dataObj = nlohmann::json::object();
+			for (const auto& [formID, app] : _npcData) {
+				std::string keyStr = FormIDToString(formID);
+				if (!keyStr.empty()) {
+					dataObj[keyStr] = app;
+				}
+			}
+			j["data"] = dataObj;
+
+			std::ofstream file(UAPS_JSON_FILE);
+			if (file.is_open()) {
+				file << j.dump(2);
+				spdlog::info("Saved UAPS data to JSON.");
+			}
+		} catch (const std::exception& e) {
+			spdlog::error("Error saving JSON: {}", e.what());
+		}
+	}).detach();
+}
+
+void PersistenceManager::SaveCallback(const F4SE::SerializationInterface*) { SaveToJson(); }
+void PersistenceManager::LoadCallback(const F4SE::SerializationInterface*) { LoadFromJson(); }
+void PersistenceManager::RevertCallback(const F4SE::SerializationInterface*) {
+	std::lock_guard<std::mutex> lock(_lock);
+	_npcData.clear();
+	_runtimeCache.clear();
+	spdlog::info("Serialization: Reverted UAPS data.");
+}
+
+namespace HookPoints {
+	typedef RE::NiAVObject* (*_Actor_Load3D)(RE::Actor* a_this, bool a_backgroundLoading);
+	REL::Relocation<_Actor_Load3D> Actor_Load3D_Original;
+
+	RE::NiAVObject* Actor_Load3D_Hook(RE::Actor* a_this, bool a_backgroundLoading) {
+		auto result = Actor_Load3D_Original(a_this, a_backgroundLoading);
+		if (a_this && a_this->Get3D()) {
+			PersistenceManager::GetSingleton()->ApplyAppearance(a_this);
+		}
+		return result;
+	}
+	
+	void Install() {
+		spdlog::info("Installing Hooks...");
+		REL::Relocation<uintptr_t> actorVtbl{ RE::VTABLE::Actor[0] };
+		Actor_Load3D_Original = actorVtbl.write_vfunc(0x86, Actor_Load3D_Hook);
+		spdlog::info("Hooks installed.");
+	}
+}
+
+void PersistenceManager::InitializeHooks() {
+	HookPoints::Install();
+	LoadFromJson(); 
+}
+
+void PersistenceManager::RegisterMenuWatcher() {}

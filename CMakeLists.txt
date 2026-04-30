@@ -16,12 +16,13 @@ include(FetchContent)
 FetchContent_Declare(
     CommonLibF4
     GIT_REPOSITORY https://github.com/Ryan-rsm-McKenzie/CommonLibF4.git
+    GIT_TAG community
     SOURCE_SUBDIR CommonLibF4
 )
 FetchContent_MakeAvailable(CommonLibF4)
 
 # Find Dependencies
-find_package(Boost REQUIRED)
+
 find_package(spdlog REQUIRED CONFIG)
 find_package(nlohmann_json REQUIRED CONFIG)
 
@@ -46,6 +47,7 @@ target_link_libraries(${PLUGIN_NAME}
         CommonLibF4::CommonLibF4
         spdlog::spdlog
         nlohmann_json::nlohmann_json
+        Bcrypt
 )
 
 # F4SE Plugin Definitions
