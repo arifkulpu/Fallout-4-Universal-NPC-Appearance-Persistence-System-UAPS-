@@ -54,6 +54,7 @@ extern "C" DLLEXPORT constinit auto F4SEPlugin_Version = []() constexpr {
 	v.UsesSigScanning(false);
 	v.IsLayoutDependent(true);
 	v.HasNoStructUse(false);
+	v.CompatibleVersions({ REL::Version{ 1, 10, 163, 0 }, REL::Version{ 1, 10, 980, 0 }, REL::Version{ 1, 10, 984, 0 } });
 	return v;
 }();
 

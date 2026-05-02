@@ -52,3 +52,29 @@ NPC görünüm değişikliklerini kayıtlar (save), hücre değişimleri ve oyun
 - [Fallout 4](https://store.steampowered.com/app/377160/Fallout_4/) (Sürüm 1.10.163 veya Next-Gen/AE 1.10.980+)
 - [F4SE](https://f4se.silverlock.org/) (Fallout 4 Script Extender)
 - [Address Library for F4SE Plugins](https://www.nexusmods.com/fallout4/mods/47327)
+
+## License / Lisans
+
+Copyright (c) 2026 Arif KULPU. All Rights Reserved. — Tüm Hakları Saklıdır.
+See `LICENSE.md` for details.
+
+Unauthorized copying, modification, distribution, or use of this software
+and associated documentation files, in any medium, is strictly prohibited
+without the express prior written permission of the copyright holder.
+
+This software is provided "as is", without warranty of any kind.
+The copyright holder shall not be liable for any claim, damages, or other
+liability arising from the use of this software.
+
+---
+
+Telif Hakkı (c) 2026 Arif KULPU. Tüm Hakları Saklıdır.
+Detaylar için `LICENSE.md` dosyasına bakınız.
+
+Bu yazılımın ve ilgili belgelerinin herhangi bir ortamda izinsiz olarak
+kopyalanması, değiştirilmesi, dağıtılması veya kullanılması, telif hakkı
+sahibinin açık ve önceden yazılı izni olmaksızın kesinlikle yasaktır.
+
+Bu yazılım "olduğu gibi" sunulmaktadır; herhangi bir garanti verilmemektedir.
+Telif hakkı sahibi, bu yazılımın kullanımından doğan hiçbir talep, zarar
+veya yükümlülükten sorumlu tutulamaz.
