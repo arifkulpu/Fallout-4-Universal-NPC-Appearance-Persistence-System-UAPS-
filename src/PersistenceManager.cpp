@@ -304,13 +304,17 @@ void PersistenceManager::ApplyAppearance(RE::Actor* a_actor) {
 
 				for (const auto& td : savedData.tints) {
 					if (td.type == 0) { // Palette
-						auto newEntry = new RE::BGSCharacterTint::PaletteEntry();
+						auto newEntry = static_cast<RE::BGSCharacterTint::PaletteEntry*>(RE::malloc(sizeof(RE::BGSCharacterTint::PaletteEntry)));
+						std::memset(newEntry, 0, sizeof(RE::BGSCharacterTint::PaletteEntry));
+						new (newEntry) RE::BGSCharacterTint::PaletteEntry(); // Placement new for vtable
 						newEntry->index = td.index;
 						newEntry->color = td.color;
 						newEntry->alpha = td.alpha;
 						entriesList->entries.push_front(newEntry);
 					} else { // Texture
-						auto newEntry = new RE::BGSCharacterTint::TextureEntry();
+						auto newEntry = static_cast<RE::BGSCharacterTint::TextureEntry*>(RE::malloc(sizeof(RE::BGSCharacterTint::TextureEntry)));
+						std::memset(newEntry, 0, sizeof(RE::BGSCharacterTint::TextureEntry));
+						new (newEntry) RE::BGSCharacterTint::TextureEntry(); // Placement new for vtable
 						newEntry->index = td.index;
 						newEntry->alpha = td.alpha;
 						entriesList->entries.push_front(newEntry);
@@ -460,8 +464,10 @@ namespace HookPoints {
 	void Install() {
 		auto version = REL::Module::get().version();
 
-		// Next Gen 2 (1.11.191+) runtime shifts Actor vtable by 2 slots.
-		uint32_t load3DIndex = (version >= REL::Version{ 1, 11, 191, 0 }) ? 0x88 : 0x86;
+		// Next Gen (1.10.980+) runtime shifts Actor vtable by 3 slots.
+		// Old Gen (1.10.163): 0x86 (134)
+		// Next Gen (1.10.980+): 0x89 (137)
+		uint32_t load3DIndex = (version >= REL::Version{ 1, 10, 980, 0 }) ? 0x89 : 0x86;
 
 		spdlog::info("Installing Hooks... Runtime: {}.{}.{}.{} -> Using Index: 0x{:X}",
 			version.major(), version.minor(), version.patch(), version.build(), load3DIndex);
