@@ -14,11 +14,35 @@
 
 constexpr auto UAPS_JSON_FILE = "Data/F4SE/Plugins/UAPS_Data.json";
 
-// Manual declaration for BGSCharacterTint::Entries to avoid missing definitions
 namespace RE {
 	namespace BGSCharacterTint {
+		enum class TintType : uint32_t {
+			kPalette = 0,
+			kTexture = 1
+		};
+
+		struct Entry {
+			virtual ~Entry() = default;
+			virtual TintType GetType() const = 0;
+
+			uint16_t index;
+			uint8_t  pad0A[2];
+		};
+
+		struct PaletteEntry : public Entry {
+			virtual TintType GetType() const override { return TintType::kPalette; }
+			uint32_t color;
+			float    alpha;
+		};
+
+		struct TextureEntry : public Entry {
+			virtual TintType GetType() const override { return TintType::kTexture; }
+			// Texture entries might have more data, but index/alpha are often enough
+			float alpha;
+		};
+
 		struct Entries {
-			BSSimpleList<void*> entries; // Using void* as we don't have the full Entry struct definition
+			BSSimpleList<Entry*> entries; 
 		};
 	}
 }
@@ -83,8 +107,9 @@ uint64_t PersistenceManager::ComputeHash(const NPC_Appearance& data) {
 	fnv(data.geometry.weights.data(), data.geometry.weights.size() * sizeof(float));
 	for (const auto& t : data.tints) {
 		fnv(&t.index, sizeof(t.index));
-		fnv(t.color.data(), t.color.size());
+		fnv(&t.color, sizeof(t.color));
 		fnv(&t.alpha, sizeof(t.alpha));
+		fnv(&t.type, sizeof(t.type));
 	}
 	return hash;
 }
@@ -104,6 +129,14 @@ void PersistenceManager::SaveToWatchlist(RE::Actor* a_actor) {
 	uint32_t sColor = (npc->bodyTintColorR << 16) | (npc->bodyTintColorG << 8) | npc->bodyTintColorB;
 	data.skinColor = ColorToHex(sColor);
 	
+	// Appearance Source (faceNPC) logic
+	if (npc->faceNPC) {
+		data.appearanceSource = FormIDToString(npc->faceNPC->formID);
+		spdlog::info("Detected appearance source (Template): {} for NPC: {}", data.appearanceSource, data.name);
+	} else {
+		data.appearanceSource = "Self";
+	}
+	
 	if (npc->morphSliderValues) {
 		for (auto& entry : *npc->morphSliderValues) {
 			data.geometry.morphs.push_back(entry.second);
@@ -117,6 +150,28 @@ void PersistenceManager::SaveToWatchlist(RE::Actor* a_actor) {
 			else if (hpStr.find("Eyes") != std::string::npos) data.assets.eyesID = hpStr;
 			else data.assets.otherHeadParts.push_back(hpStr);
 		}
+	}
+
+	if (npc->tintingData) {
+		auto entriesList = reinterpret_cast<RE::BGSCharacterTint::Entries*>(npc->tintingData);
+		for (auto entry : entriesList->entries) {
+			if (entry) {
+				TintData td;
+				td.index = entry->index;
+				td.type = static_cast<uint32_t>(entry->GetType());
+				if (td.type == 0) { // Palette
+					auto palette = static_cast<RE::BGSCharacterTint::PaletteEntry*>(entry);
+					td.color = palette->color;
+					td.alpha = palette->alpha;
+				} else { // Texture
+					auto texture = static_cast<RE::BGSCharacterTint::TextureEntry*>(entry);
+					td.alpha = texture->alpha;
+					td.color = 0;
+				}
+				data.tints.push_back(td);
+			}
+		}
+		spdlog::info("Saved {} tints for NPC: {}", data.tints.size(), data.name);
 	}
 
 	data.appearanceHash = ComputeHash(data);
@@ -237,18 +292,31 @@ void PersistenceManager::ApplyAppearance(RE::Actor* a_actor) {
 				}
 			}
 
-			// 3. Tints (Clear list and apply skin color to avoid Brown Face)
+			// 3. Tints (Restore saved tints to fix partial application/Botox issues)
 			uint32_t parsedColor = PersistenceManager::GetSingleton()->HexToColor(savedData.skinColor);
 			npc->bodyTintColorR = (parsedColor >> 16) & 0xFF;
 			npc->bodyTintColorG = (parsedColor >> 8) & 0xFF;
 			npc->bodyTintColorB = parsedColor & 0xFF;
 
-			// Clear tints using memory offset logic if tintingData is valid
 			if (npc->tintingData) {
-				// We don't have the exact Entry struct, so we can clear the BSSimpleList
-				// This usually resets the face overlays, solving the Brown Face bug.
 				auto entriesList = reinterpret_cast<RE::BGSCharacterTint::Entries*>(npc->tintingData);
-				entriesList->entries.clear(); 
+				entriesList->entries.clear(); // Clear existing to avoid stacking
+
+				for (const auto& td : savedData.tints) {
+					if (td.type == 0) { // Palette
+						auto newEntry = new RE::BGSCharacterTint::PaletteEntry();
+						newEntry->index = td.index;
+						newEntry->color = td.color;
+						newEntry->alpha = td.alpha;
+						entriesList->entries.push_front(newEntry);
+					} else { // Texture
+						auto newEntry = new RE::BGSCharacterTint::TextureEntry();
+						newEntry->index = td.index;
+						newEntry->alpha = td.alpha;
+						entriesList->entries.push_front(newEntry);
+					}
+				}
+				spdlog::info("Restored {} tints for {}", savedData.tints.size(), savedData.name);
 			}
 
 			// 4. QueueRestoring & UpdateAppearance
@@ -317,8 +385,59 @@ void PersistenceManager::SaveToJson() {
 	}).detach();
 }
 
-void PersistenceManager::SaveCallback(const F4SE::SerializationInterface*) { SaveToJson(); }
-void PersistenceManager::LoadCallback(const F4SE::SerializationInterface*) { LoadFromJson(); }
+void PersistenceManager::SaveCallback(const F4SE::SerializationInterface* a_intfc) { 
+	std::lock_guard<std::mutex> lock(_lock);
+	try {
+		nlohmann::json j;
+		nlohmann::json dataObj = nlohmann::json::object();
+		for (const auto& [formID, app] : _npcData) {
+			dataObj[std::to_string(formID)] = app;
+		}
+		j["data"] = dataObj;
+
+		std::string dumped = j.dump();
+		if (!a_intfc->OpenRecord('DATA', 1)) {
+			spdlog::error("Failed to open F4SE record for saving.");
+			return;
+		}
+		a_intfc->WriteRecordData(dumped.data(), static_cast<uint32_t>(dumped.size()));
+		spdlog::info("Serialized {} NPC entries to co-save.", _npcData.size());
+	} catch (const std::exception& e) {
+		spdlog::error("Error in SaveCallback: {}", e.what());
+	}
+}
+
+void PersistenceManager::LoadCallback(const F4SE::SerializationInterface* a_intfc) {
+	std::lock_guard<std::mutex> lock(_lock);
+	_npcData.clear();
+	_runtimeCache.clear();
+
+	uint32_t type, version, length;
+	while (a_intfc->GetNextRecordInfo(type, version, length)) {
+		if (type == 'DATA') {
+			std::string data;
+			data.resize(length);
+			a_intfc->ReadRecordData(data.data(), length);
+
+			try {
+				auto j = nlohmann::json::parse(data);
+				if (j.contains("data")) {
+					for (auto& [keyStr, val] : j["data"].items()) {
+						uint32_t formID = std::stoul(keyStr);
+						auto resolvedID = a_intfc->ResolveFormID(formID);
+						if (resolvedID) {
+							_npcData[*resolvedID] = val.get<NPC_Appearance>();
+						}
+					}
+				}
+				spdlog::info("Loaded {} NPC entries from co-save.", _npcData.size());
+			} catch (const std::exception& e) {
+				spdlog::error("Error parsing serialized data: {}", e.what());
+			}
+		}
+	}
+}
+
 void PersistenceManager::RevertCallback(const F4SE::SerializationInterface*) {
 	std::lock_guard<std::mutex> lock(_lock);
 	_npcData.clear();

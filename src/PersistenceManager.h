@@ -12,13 +12,13 @@ struct TintData
 {
 	uint16_t index;
 	float alpha;
-	std::string color;
-	uint32_t blendOp; // Keeping this just in case, though maybe not in JSON initially
+	uint32_t color; 
+	uint32_t type; // 0 = Palette, 1 = Texture
 
-	NLOHMANN_DEFINE_TYPE_INTRUSIVE(TintData, index, alpha, color, blendOp)
+	NLOHMANN_DEFINE_TYPE_INTRUSIVE(TintData, index, alpha, color, type)
 
 	bool operator==(const TintData& a_rhs) const {
-		return index == a_rhs.index && color == a_rhs.color && alpha == a_rhs.alpha && blendOp == a_rhs.blendOp;
+		return index == a_rhs.index && color == a_rhs.color && alpha == a_rhs.alpha && type == a_rhs.type;
 	}
 };
 
@@ -47,10 +47,10 @@ struct NPC_Appearance
 	AssetsData assets;
 	std::vector<TintData> tints;
 	std::string skinColor; // e.g. "#FFFFFF"
-
+	std::string appearanceSource{"Self"}; // FormID|ModName of the template (if any)
 	uint64_t appearanceHash;
 
-	NLOHMANN_DEFINE_TYPE_INTRUSIVE(NPC_Appearance, name, type, geometry, assets, tints, skinColor, appearanceHash)
+	NLOHMANN_DEFINE_TYPE_INTRUSIVE(NPC_Appearance, name, type, geometry, assets, tints, skinColor, appearanceSource, appearanceHash)
 };
 
 struct RuntimeState
