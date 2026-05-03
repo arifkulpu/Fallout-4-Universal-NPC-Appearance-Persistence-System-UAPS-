@@ -458,10 +458,22 @@ namespace HookPoints {
 	}
 	
 	void Install() {
-		spdlog::info("Installing Hooks...");
+		auto version = REL::Module::get().version();
+
+		// Next Gen 2 (1.11.191+) runtime shifts Actor vtable by 2 slots.
+		uint32_t load3DIndex = (version >= REL::Version{ 1, 11, 191, 0 }) ? 0x88 : 0x86;
+
+		spdlog::info("Installing Hooks... Runtime: {}.{}.{}.{} -> Using Index: 0x{:X}",
+			version.major(), version.minor(), version.patch(), version.build(), load3DIndex);
+
 		REL::Relocation<uintptr_t> actorVtbl{ RE::VTABLE::Actor[0] };
-		Actor_Load3D_Original = actorVtbl.write_vfunc(0x86, Actor_Load3D_Hook);
-		spdlog::info("Hooks installed.");
+
+		if (actorVtbl.address()) {
+			Actor_Load3D_Original = actorVtbl.write_vfunc(load3DIndex, Actor_Load3D_Hook);
+			spdlog::info("Hooks installed successfully.");
+		} else {
+			spdlog::critical("Failed to find Actor VTable! Hooking aborted.");
+		}
 	}
 }
 
