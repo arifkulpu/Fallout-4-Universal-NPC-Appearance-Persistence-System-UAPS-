@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <mutex>
+#include <atomic>
 #include <nlohmann/json.hpp>
 
 struct TintData
@@ -77,6 +78,17 @@ public:
 	void InitializeHooks();
 	void RegisterMenuWatcher();
 
+	// Game state events
+	void OnPostLoadGame();
+	void OnNewGame();
+	bool IsGameLoaded() const { return _gameLoaded.load(); }
+
+	// Called by task-queue lambda to safely reset the applying flag
+	void ResetApplyingFlag(uint32_t a_lookupID) {
+		std::lock_guard<std::mutex> lock(_lock);
+		_runtimeCache[a_lookupID].isApplying = false;
+	}
+
 	// JSON File operations
 	void LoadFromJson();
 	void SaveToJson();
@@ -102,4 +114,7 @@ private:
 	std::unordered_map<uint32_t, NPC_Appearance> _npcData;
 	std::unordered_map<uint32_t, RuntimeState> _runtimeCache;
 	std::mutex _lock;
+
+	// Loading screen guard: true only after kPostLoadGame / kNewGame fires
+	std::atomic<bool> _gameLoaded{ false };
 };

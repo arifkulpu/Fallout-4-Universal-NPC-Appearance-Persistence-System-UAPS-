@@ -40,7 +40,18 @@ void MessageHandler(F4SE::MessagingInterface::Message* a_msg)
 {
 	switch (a_msg->type) {
 	case F4SE::MessagingInterface::kGameDataReady:
-		PersistenceManager::GetSingleton()->InitializeHooks();
+		spdlog::info("kGameDataReady received.");
+		// JSON load is already done in InitializeHooks during F4SEPlugin_Load
+		break;
+
+	case F4SE::MessagingInterface::kPostLoadGame:
+		// Game save finished loading — safe to apply appearances now.
+		PersistenceManager::GetSingleton()->OnPostLoadGame();
+		break;
+
+	case F4SE::MessagingInterface::kNewGame:
+		// New game started — also safe to apply from this point.
+		PersistenceManager::GetSingleton()->OnNewGame();
 		break;
 	}
 }
@@ -131,6 +142,12 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 		});
 		spdlog::info("Registered F4SE Serialization Callbacks.");
 	}
+
+	// Install hooks early in Load
+	PersistenceManager::GetSingleton()->InitializeHooks();
+
+	spdlog::info("F4SEPlugin_Load complete.");
+	spdlog::default_logger()->flush();
 
 	return true;
 }

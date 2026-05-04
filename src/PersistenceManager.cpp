@@ -198,7 +198,7 @@ bool PersistenceManager::IsInWatchlist(std::uint32_t a_formID) {
 // ------------------------------------------------------------
 // SAFE PAPYRUS INVOCATION HELPERS
 // ------------------------------------------------------------
-void CallPapyrusChangeHeadPart(RE::Actor* a_actor, RE::BGSHeadPart* a_part)
+static void CallPapyrusChangeHeadPart(RE::Actor* a_actor, RE::BGSHeadPart* a_part)
 {
 	auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
 	if (!vm || !a_actor || !a_part) return;
@@ -212,7 +212,7 @@ void CallPapyrusChangeHeadPart(RE::Actor* a_actor, RE::BGSHeadPart* a_part)
 	}
 }
 
-void CallPapyrusUpdateAppearance(RE::Actor* a_actor)
+static void CallPapyrusUpdateAppearance(RE::Actor* a_actor)
 {
 	auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
 	if (!vm || !a_actor) return;
@@ -226,10 +226,8 @@ void CallPapyrusUpdateAppearance(RE::Actor* a_actor)
 	}
 }
 
-void CallPapyrusQueueRestoring(RE::Actor* a_actor)
+static void CallPapyrusQueueRestoring(RE::Actor* a_actor)
 {
-	// QueueRestoring is often empty or not strictly necessary if UpdateAppearance works, but we call it if defined.
-	// We'll use the same pattern.
 	auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
 	if (!vm || !a_actor) return;
 
@@ -254,20 +252,34 @@ void PersistenceManager::ApplyAppearance(RE::Actor* a_actor) {
 	if (!_npcData.contains(lookupID)) return;
 
 	auto& cache = _runtimeCache[lookupID];
-	if (cache.isApplying) return; 
+	if (cache.isApplying) return;
+
+	// Safety: Don't apply during loading screens
+	auto ui = RE::UI::GetSingleton();
+	if (ui && ui->GetMenuOpen("LoadingMenu")) {
+		return;
+	}
 
 	auto& savedData = _npcData[lookupID];
 	if (cache.lastHash == savedData.appearanceHash && savedData.appearanceHash != 0) {
-		return; 
+		return;
 	}
 
 	cache.isApplying = true;
 	spdlog::info("Queueing appearance application for NPC: {}", savedData.name);
 
 	// TASK QUEUE (Execute on Main Thread to prevent CTD)
-	F4SE::GetTaskInterface()->AddTask([a_actor, npc, savedData]() {
+	F4SE::GetTaskInterface()->AddTask([a_actor, npc, savedData, lookupID]() {
 		try {
-			// 1. FaceGen (Morphs)
+			// Safety: actor and its 3D must still be alive and valid
+			if (!a_actor || !npc || !a_actor->Get3D()) {
+				PersistenceManager::GetSingleton()->ResetApplyingFlag(lookupID);
+				return;
+			}
+
+			spdlog::info("Applying appearance to: {} ({:08X})", savedData.name, lookupID);
+
+			// 1. FaceGen (Morphs) – direct write, no Papyrus needed
 			if (npc->morphSliderValues && savedData.geometry.morphs.size() == npc->morphSliderValues->size()) {
 				uint32_t index = 0;
 				for (auto& [key, val] : *npc->morphSliderValues) {
@@ -275,66 +287,82 @@ void PersistenceManager::ApplyAppearance(RE::Actor* a_actor) {
 				}
 			}
 
-			// 2. HeadParts (Papyrus VM üzerinden ChangeHeadPart)
+			// 2. HeadParts – Papyrus VM üzerinden ChangeHeadPart (Artık güvenli çünkü kPostLoadGame sonrası çalışır)
+			auto* pm = PersistenceManager::GetSingleton();
 			if (!savedData.assets.hairID.empty()) {
-				uint32_t hairFormID = PersistenceManager::GetSingleton()->StringToFormID(savedData.assets.hairID);
+				uint32_t hairFormID = pm->StringToFormID(savedData.assets.hairID);
 				if (hairFormID) {
 					auto newHair = RE::TESForm::GetFormByID<RE::BGSHeadPart>(hairFormID);
 					if (newHair) CallPapyrusChangeHeadPart(a_actor, newHair);
 				}
 			}
-			
+
 			if (!savedData.assets.eyesID.empty()) {
-				uint32_t eyesFormID = PersistenceManager::GetSingleton()->StringToFormID(savedData.assets.eyesID);
+				uint32_t eyesFormID = pm->StringToFormID(savedData.assets.eyesID);
 				if (eyesFormID) {
 					auto newEyes = RE::TESForm::GetFormByID<RE::BGSHeadPart>(eyesFormID);
 					if (newEyes) CallPapyrusChangeHeadPart(a_actor, newEyes);
 				}
 			}
 
-			// 3. Tints (Restore saved tints to fix partial application/Botox issues)
-			uint32_t parsedColor = PersistenceManager::GetSingleton()->HexToColor(savedData.skinColor);
+			// 3. Skin colour – direct NPC field write
+			uint32_t parsedColor = pm->HexToColor(savedData.skinColor);
 			npc->bodyTintColorR = (parsedColor >> 16) & 0xFF;
 			npc->bodyTintColorG = (parsedColor >> 8) & 0xFF;
 			npc->bodyTintColorB = parsedColor & 0xFF;
 
-			if (npc->tintingData) {
+			// 4. Tints – rebuild the entry list safely
+			if (npc->tintingData && !savedData.tints.empty()) {
 				auto entriesList = reinterpret_cast<RE::BGSCharacterTint::Entries*>(npc->tintingData);
-				entriesList->entries.clear(); // Clear existing to avoid stacking
+
+				// BSSimpleList has no clear(); drain by pop_front
+				while (!entriesList->entries.empty()) {
+					delete entriesList->entries.front();
+					entriesList->entries.pop_front();
+				}
 
 				for (const auto& td : savedData.tints) {
 					if (td.type == 0) { // Palette
-						auto newEntry = static_cast<RE::BGSCharacterTint::PaletteEntry*>(RE::malloc(sizeof(RE::BGSCharacterTint::PaletteEntry)));
-						std::memset(newEntry, 0, sizeof(RE::BGSCharacterTint::PaletteEntry));
-						new (newEntry) RE::BGSCharacterTint::PaletteEntry(); // Placement new for vtable
-						newEntry->index = td.index;
-						newEntry->color = td.color;
-						newEntry->alpha = td.alpha;
-						entriesList->entries.push_front(newEntry);
+						auto* newEntry = new RE::BGSCharacterTint::PaletteEntry();
+						if (newEntry) {
+							newEntry->index = td.index;
+							newEntry->color = td.color;
+							newEntry->alpha = td.alpha;
+							entriesList->entries.push_front(newEntry);
+						}
 					} else { // Texture
-						auto newEntry = static_cast<RE::BGSCharacterTint::TextureEntry*>(RE::malloc(sizeof(RE::BGSCharacterTint::TextureEntry)));
-						std::memset(newEntry, 0, sizeof(RE::BGSCharacterTint::TextureEntry));
-						new (newEntry) RE::BGSCharacterTint::TextureEntry(); // Placement new for vtable
-						newEntry->index = td.index;
-						newEntry->alpha = td.alpha;
-						entriesList->entries.push_front(newEntry);
+						auto* newEntry = new RE::BGSCharacterTint::TextureEntry();
+						if (newEntry) {
+							newEntry->index = td.index;
+							newEntry->alpha = td.alpha;
+							entriesList->entries.push_front(newEntry);
+						}
 					}
 				}
 				spdlog::info("Restored {} tints for {}", savedData.tints.size(), savedData.name);
 			}
 
-			// 4. QueueRestoring & UpdateAppearance
+			// 5. Update appearance via Papyrus & Engine
+			// Using multiple update methods to ensure the engine registers the change
 			CallPapyrusQueueRestoring(a_actor);
 			CallPapyrusUpdateAppearance(a_actor);
 			
+			// Direct engine update if possible
+			a_actor->Update3DPosition(true);
+
 			spdlog::info("Appearance applied on main thread for {}", savedData.name);
 		} catch (const std::exception& e) {
 			spdlog::error("Error in TaskQueue applying appearance: {}", e.what());
+		} catch (...) {
+			spdlog::error("Unknown error in TaskQueue applying appearance.");
 		}
+
+		// Reset applying flag regardless of success/failure
+		PersistenceManager::GetSingleton()->ResetApplyingFlag(lookupID);
 	});
 
 	cache.lastHash = savedData.appearanceHash;
-	cache.isApplying = false;
+	// Note: isApplying is reset inside the task after execution
 }
 
 void PersistenceManager::LoadFromJson() {
@@ -446,6 +474,8 @@ void PersistenceManager::RevertCallback(const F4SE::SerializationInterface*) {
 	std::lock_guard<std::mutex> lock(_lock);
 	_npcData.clear();
 	_runtimeCache.clear();
+	// Disable hook until kPostLoadGame fires so we never fire during loading screen
+	_gameLoaded.store(false);
 	spdlog::info("Serialization: Reverted UAPS data.");
 }
 
@@ -454,9 +484,17 @@ namespace HookPoints {
 	REL::Relocation<_Actor_Load3D> Actor_Load3D_Original;
 
 	RE::NiAVObject* Actor_Load3D_Hook(RE::Actor* a_this, bool a_backgroundLoading) {
-		auto result = Actor_Load3D_Original(a_this, a_backgroundLoading);
-		if (a_this && a_this->Get3D()) {
-			PersistenceManager::GetSingleton()->ApplyAppearance(a_this);
+		RE::NiAVObject* result = nullptr;
+		if (Actor_Load3D_Original.address()) {
+			result = Actor_Load3D_Original(a_this, a_backgroundLoading);
+		}
+
+		// Guard: only apply after kPostLoadGame / kNewGame has fired.
+		if (a_this && a_this->Get3D() && PersistenceManager::GetSingleton()->IsGameLoaded()) {
+			// Basic sanity check to ensure we are looking at an Actor
+			if (a_this->GetFormType() == RE::ENUM_FORM_ID::kACHR) {
+				PersistenceManager::GetSingleton()->ApplyAppearance(a_this);
+			}
 		}
 		return result;
 	}
@@ -464,28 +502,66 @@ namespace HookPoints {
 	void Install() {
 		auto version = REL::Module::get().version();
 
-		// Next Gen (1.10.980+) runtime shifts Actor vtable by 3 slots.
-		// Old Gen (1.10.163): 0x86 (134)
-		// Next Gen (1.10.980+): 0x89 (137)
-		uint32_t load3DIndex = (version >= REL::Version{ 1, 10, 980, 0 }) ? 0x89 : 0x86;
+		// Fallout 4 VTable Index for Actor::Load3D:
+		// 1.10.163 (Old Gen): 0x86 (134)
+		// 1.10.980 - 1.10.984 (Next Gen 1): 0x89 (137)
+		// 1.11.184 - 1.11.193+ (Next Gen 2): 0x8A (138) - Some reports suggest 0x8A or even 0x8C.
+		
+		uint32_t load3DIndex = 0x86;
+		if (version >= REL::Version{ 1, 11, 184, 0 }) {
+			load3DIndex = 0x8A;
+		} else if (version >= REL::Version{ 1, 10, 980, 0 }) {
+			load3DIndex = 0x89;
+		}
 
-		spdlog::info("Installing Hooks... Runtime: {}.{}.{}.{} -> Using Index: 0x{:X}",
+		spdlog::info("Installing Actor::Load3D Hook... Runtime: {}.{}.{}.{} -> Using Index: 0x{:X}",
 			version.major(), version.minor(), version.patch(), version.build(), load3DIndex);
 
 		REL::Relocation<uintptr_t> actorVtbl{ RE::VTABLE::Actor[0] };
 
 		if (actorVtbl.address()) {
-			Actor_Load3D_Original = actorVtbl.write_vfunc(load3DIndex, Actor_Load3D_Hook);
-			spdlog::info("Hooks installed successfully.");
+			spdlog::info("Actor VTable found at: {:016X}", actorVtbl.address());
+			try {
+				Actor_Load3D_Original = actorVtbl.write_vfunc(load3DIndex, Actor_Load3D_Hook);
+				if (Actor_Load3D_Original.address()) {
+					spdlog::info("Actor::Load3D Hooked. Original at: {:016X}", Actor_Load3D_Original.address());
+				} else {
+					spdlog::error("write_vfunc returned null for Actor::Load3D!");
+				}
+			} catch (const std::exception& e) {
+				spdlog::critical("Exception while hooking Actor::Load3D: {}", e.what());
+			}
 		} else {
-			spdlog::critical("Failed to find Actor VTable! Hooking aborted.");
+			spdlog::critical("Failed to find Actor VTable address! Relocation for VTABLE::Actor[0] returned 0.");
 		}
 	}
 }
 
 void PersistenceManager::InitializeHooks() {
+	spdlog::info("PersistenceManager::InitializeHooks() called.");
 	HookPoints::Install();
-	LoadFromJson(); 
+	LoadFromJson();
+	spdlog::info("PersistenceManager::InitializeHooks() complete.");
+	spdlog::default_logger()->flush();
+}
+
+void PersistenceManager::OnPostLoadGame() {
+	spdlog::info("kPostLoadGame received – enabling appearance hook.");
+	_gameLoaded.store(true);
+
+	// Re-apply for any actors that are already loaded
+	if (auto processLists = RE::ProcessLists::GetSingleton()) {
+		for (auto& actorHandle : processLists->highActorHandles) {
+			if (auto actor = actorHandle.get()) {
+				ApplyAppearance(actor.get());
+			}
+		}
+	}
+}
+
+void PersistenceManager::OnNewGame() {
+	spdlog::info("kNewGame received – enabling appearance hook.");
+	_gameLoaded.store(true);
 }
 
 void PersistenceManager::RegisterMenuWatcher() {}
